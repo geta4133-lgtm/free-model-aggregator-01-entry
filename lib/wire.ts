@@ -60,7 +60,15 @@ export function anthropicError(type: string, message: string): Json {
 
 /** An error in OpenAI's shape (Chat Completions). */
 export function openAIError(message: string, type: string, code: string | null): Json {
-  return { error: { message, type, code } };
+  const errPayload: Json = { message, type };
+  if (code !== null) errPayload.code = code;
+  return { error: errPayload };
+}
+
+/** Anthropic stop reason mapping helper with default fallback */
+export function getAnthropicStopReason(reason: unknown): string {
+  if (typeof reason !== 'string') return 'end_turn';
+  return stopReasonOf(reason);
 }
 
 /** The text of a string or of a block array's text blocks; '' when there is none. */
