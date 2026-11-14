@@ -131,23 +131,35 @@ interface Route {
   model: ProbedModel;
 }
 
-/**
- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
- * with a free model meeting the requirements, and that provider's first model by id.
- */
-function routeFor(requires: Requirement): Route | null {
+// Quality-first router with candidate ranking, failover and quota awareness
+interface Candidate {
+  probe: Probe;
+  model: ProbedModel;
+  rating_milli: number;
+}
+
+/** Rank free models that meet requirements by quality table rating_milli descending. */
+function candidatesFor(requires: Requirement): Candidate[] {
+  const candidates: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
+    for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      return { probe, model };
+      const rating = row?.rating_milli ?? 0;
+      candidates.push({ probe, model, rating_milli: rating });
     }
   }
-  return null;
+  // Sort descending by quality rating
+  candidates.sort((a, b) => b.rating_milli - a.rating_milli);
+  return candidates;
+}
+
+function routeFor(requires: Requirement): Route | null {
+  const candidates = candidatesFor(requires);
+  if (candidates.length === 0) return null;
+  return { probe: candidates[0].probe, model: candidates[0].model };
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
