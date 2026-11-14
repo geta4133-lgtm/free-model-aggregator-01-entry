@@ -511,6 +511,8 @@ async function* geminiStreamToOpenAI(stream: ReadableStream<Uint8Array>, model: 
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let finalUsage: Json | null = null;
+  let fullText = '';
 
   const chunk = (delta: Json, finish: string | null = null, usage: Json | null = null) => {
     return `data: ${JSON.stringify({
@@ -540,8 +542,15 @@ async function* geminiStreamToOpenAI(stream: ReadableStream<Uint8Array>, model: 
           try {
             const data: unknown = JSON.parse(payload);
             if (isRecord(data)) {
+              if (isRecord(data.usageMetadata)) {
+                const meta = data.usageMetadata;
+                const p = typeof meta.promptTokenCount === 'number' ? meta.promptTokenCount : 0;
+                const c = typeof meta.candidatesTokenCount === 'number' ? meta.candidatesTokenCount : 0;
+                finalUsage = { prompt_tokens: p, completion_tokens: c, total_tokens: p + c };
+              }
               const text = geminiResponseText(data);
               if (text !== '') {
+                fullText += text;
                 yield chunk({ content: text });
               }
               const cand = Array.isArray(data.candidates) && isRecord(data.candidates[0]) ? data.candidates[0] : null;
@@ -558,6 +567,21 @@ async function* geminiStreamToOpenAI(stream: ReadableStream<Uint8Array>, model: 
   } finally {
     reader.releaseLock();
   }
+
+  // If no usageMetadata was emitted by Gemini stream, compute from text length
+  if (finalUsage === null) {
+    const outTokens = 1 + Math.floor(fullText.length / 4);
+    finalUsage = { prompt_tokens: 1, completion_tokens: outTokens, total_tokens: 1 + outTokens };
+  }
+  // Yield final usage chunk
+  yield `data: ${JSON.stringify({
+    id: 'chatcmpl-stream',
+    object: 'chat.completion.chunk',
+    created: 1767225600,
+    model,
+    choices: [],
+    usage: finalUsage
+  })}\n\n`;
   yield 'data: [DONE]\n\n';
 }
 
@@ -566,6 +590,8 @@ async function* anthropicStreamToOpenAI(stream: ReadableStream<Uint8Array>, mode
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
 
   const chunk = (delta: Json, finish: string | null = null) => {
     return `data: ${JSON.stringify({
@@ -594,6 +620,12 @@ async function* anthropicStreamToOpenAI(stream: ReadableStream<Uint8Array>, mode
           try {
             const data: unknown = JSON.parse(payload);
             if (isRecord(data)) {
+              if (data.type === 'message_start' && isRecord(data.message) && isRecord(data.message.usage)) {
+                if (typeof data.message.usage.input_tokens === 'number') inputTokens = data.message.usage.input_tokens;
+              }
+              if (data.type === 'message_delta' && isRecord(data.usage)) {
+                if (typeof data.usage.output_tokens === 'number') outputTokens = data.usage.output_tokens;
+              }
               if (data.type === 'content_block_delta' && isRecord(data.delta) && typeof data.delta.text === 'string') {
                 yield chunk({ content: data.delta.text });
               } else if (data.type === 'message_delta' && isRecord(data.delta) && data.delta.stop_reason) {
@@ -609,6 +641,16 @@ async function* anthropicStreamToOpenAI(stream: ReadableStream<Uint8Array>, mode
   } finally {
     reader.releaseLock();
   }
+
+  // Always yield final usage frame for OpenAI client
+  yield `data: ${JSON.stringify({
+    id: 'chatcmpl-stream',
+    object: 'chat.completion.chunk',
+    created: 1767225600,
+    model,
+    choices: [],
+    usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens }
+  })}\n\n`;
   yield 'data: [DONE]\n\n';
 }
 
