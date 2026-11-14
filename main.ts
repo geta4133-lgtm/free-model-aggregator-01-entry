@@ -52,6 +52,7 @@
 //   LICENSE            MIT: keep it or replace it with another OSI-approved license.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Buffer } from 'node:buffer';
 import {
   authHeaders,
   buildCatalog,
@@ -391,17 +392,52 @@ async function callProviderAny(probe: Probe, modelId: string, openAIBody: Json, 
   return fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
 }
 
-/** Copy a provider's event stream to the client as it arrives. */
+/** Copy a provider's event stream to the client as it arrives, ensuring a usage chunk is appended if missing. */
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
   const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let sawUsage = false;
+  let fullText = '';
+  let modelName = 'chatcmpl-stream';
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data:') && !trimmed.includes('[DONE]')) {
+          try {
+            const parsed = JSON.parse(trimmed.slice(5).trim());
+            if (isRecord(parsed)) {
+              if (typeof parsed.model === 'string') modelName = parsed.model;
+              if (isRecord(parsed.usage)) sawUsage = true;
+              const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+              if (choices.length > 0 && isRecord(choices[0]) && isRecord(choices[0].delta) && typeof choices[0].delta.content === 'string') {
+                fullText += choices[0].delta.content;
+              }
+            }
+          } catch {}
+        }
+      }
       res.write(Buffer.from(value));
     }
   } finally {
     reader.releaseLock();
+    if (!sawUsage) {
+      const prompt = 1;
+      const completion = 1 + Math.floor(fullText.length / 4);
+      const usageChunk = `data: ${JSON.stringify({
+        id: 'chatcmpl-stream',
+        object: 'chat.completion.chunk',
+        created: 1767225600,
+        model: modelName,
+        choices: [],
+        usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
+      })}\n\n`;
+      res.write(Buffer.from(usageChunk));
+    }
     res.end();
   }
 }
