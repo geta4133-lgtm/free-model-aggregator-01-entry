@@ -152,11 +152,11 @@ function candidatesFor(requires: Requirement): Candidate[] {
       candidates.push({ probe, model, rating_milli: rating });
     }
   }
-  // Sort descending by quality rating
+  // Sort descending by quality rating, tie-breaking by deterministic model ID
   candidates.sort((a, b) => {
     const diff = b.rating_milli - a.rating_milli;
     if (diff !== 0) return diff;
-    return a.model.id < b.model.id ? -1 : 1;
+    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
   });
   return candidates;
 }
