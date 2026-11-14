@@ -141,6 +141,11 @@ export interface Probe {
   error: string | null;
 }
 
+/** Check if a model fulfills the request capabilities requirements */
+export function validateCandidateRequirements(requires: Requirement, caps: Capabilities): boolean {
+  return meetsRequirements(requires, caps);
+}
+
 /** What a model can do, from the listing first and the quality table second (null: neither said). */
 export interface Capabilities {
   context_length: number | null;
