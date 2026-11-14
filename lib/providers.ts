@@ -147,6 +147,15 @@ export function calculateBackoffDelay(attempt: number, baseMs = 50, maxMs = 500)
   return Math.min(delay, maxMs);
 }
 
+/** Normalize provider model identifier by stripping optional provider prefixes */
+export function normalizeModelIdentifier(providerId: string, modelId: string): string {
+  const prefix = `${providerId}/`;
+  if (modelId.startsWith(prefix)) {
+    return modelId.slice(prefix.length);
+  }
+  return modelId;
+}
+
 /** Check if a model fulfills the request capabilities requirements */
 export function validateCandidateRequirements(requires: Requirement, caps: Capabilities): boolean {
   return meetsRequirements(requires, caps);
