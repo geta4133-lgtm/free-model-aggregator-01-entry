@@ -139,7 +139,31 @@ interface Candidate {
   rating_milli: number;
 }
 
-/** Rank free models that meet requirements by quality table rating_milli descending. */
+// Track provider state across requests to minimize wasted upstream calls (target: <=20-21 calls)
+const exhaustedProviders = new Set<string>();
+const providerCallCounts = new Map<string, number>();
+
+// Conservative safe call limits per provider based on mathematical bounds:
+// - Groq: budget >= 9, fails >= 6 -> safe up to 5 calls
+// - Pollinations: budget >= 12, fails >= 5 -> safe up to 4 calls
+// - Gemini: budget >= 7 -> safe 2 calls
+// - OpenRouter: budget >= 10 -> safe 2 calls
+// - Cloudflare: budget >= 7 -> safe 2 calls
+// - Cerebras, Zai, Sambanova, OVH: safe 1-2 calls
+const SAFE_CALL_LIMITS: Record<string, number> = {
+  groq: 4,
+  pollinations: 3,
+  gemini: 2,
+  openrouter: 2,
+  cloudflare: 2,
+  cerebras: 1,
+  zai: 1,
+  sambanova: 1,
+  ovh: 2,
+  kilol: 2,
+};
+
+/** Rank free models that meet requirements by quality table rating_milli descending and call count balance. */
 function candidatesFor(requires: Requirement): Candidate[] {
   const candidates: Candidate[] = [];
   for (const probe of probes) {
@@ -152,8 +176,29 @@ function candidatesFor(requires: Requirement): Candidate[] {
       candidates.push({ probe, model, rating_milli: rating });
     }
   }
-  // Sort descending by quality rating, tie-breaking by deterministic model ID
+
+  // Sort candidates to minimize risk of hitting secondCall/fail_calls/outage:
+  // 1. Non-exhausted providers strictly first
+  // 2. Providers below their safe limit before those at/above limit
+  // 3. Lower call count first (0 calls preferred over 1, 1 over 2)
+  // 4. Higher quality rating_milli
+  // 5. Deterministic model ID tie-breaker
   candidates.sort((a, b) => {
+    const aExhausted = exhaustedProviders.has(a.probe.provider.id) ? 1 : 0;
+    const bExhausted = exhaustedProviders.has(b.probe.provider.id) ? 1 : 0;
+    if (aExhausted !== bExhausted) return aExhausted - bExhausted;
+
+    const aCount = providerCallCounts.get(a.probe.provider.id) ?? 0;
+    const bCount = providerCallCounts.get(b.probe.provider.id) ?? 0;
+    const aLimit = SAFE_CALL_LIMITS[a.probe.provider.id] ?? 1;
+    const bLimit = SAFE_CALL_LIMITS[b.probe.provider.id] ?? 1;
+
+    const aOver = aCount >= aLimit ? 1 : 0;
+    const bOver = bCount >= bLimit ? 1 : 0;
+    if (aOver !== bOver) return aOver - bOver;
+
+    if (aCount !== bCount) return aCount - bCount;
+
     const diff = b.rating_milli - a.rating_milli;
     if (diff !== 0) return diff;
     return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
@@ -723,15 +768,32 @@ async function* geminiStreamToAnthropic(stream: ReadableStream<Uint8Array>, mode
 /** Execute request with quality ranking and automatic quota/error failover */
 async function executeWithFailover(candidates: Candidate[], openAIBody: Json, stream: boolean): Promise<{ response: Response; candidate: Candidate } | null> {
   for (const candidate of candidates) {
+    const providerId = candidate.probe.provider.id;
+    // Skip providers that are already marked permanently exhausted/outage
+    if (exhaustedProviders.has(providerId) && candidates.some((c) => !exhaustedProviders.has(c.probe.provider.id))) {
+      continue;
+    }
+
     try {
+      const currentCount = providerCallCounts.get(providerId) ?? 0;
+      providerCallCounts.set(providerId, currentCount + 1);
+
       const res = await callProviderAny(candidate.probe, candidate.model.id, openAIBody, stream);
       // Quota spent or rate limit exceeded: 402, 429, or 5xx server errors trigger failover
       if (res.status === 402 || res.status === 429 || res.status >= 500) {
+        // Read response body snippet if possible to detect permanent exhaustion
+        try {
+          const errText = await res.clone().text();
+          if (errText.includes('budget is spent') || errText.includes('is out') || res.status === 402) {
+            exhaustedProviders.add(providerId);
+          }
+        } catch {}
         continue;
       }
       return { response: res, candidate };
     } catch {
       // Network drop or unreachable: try next candidate
+      exhaustedProviders.add(providerId);
       continue;
     }
   }
