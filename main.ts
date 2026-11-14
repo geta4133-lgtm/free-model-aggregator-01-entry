@@ -148,16 +148,16 @@ const providerCallCounts = new Map<string, number>();
 // drawn fail_calls (always >= 2), so spreading the 20 calls over providers that carry a big
 // free-tier budget keeps the plan's risk low. Sum = 20.
 const PLAN_CAPS: Record<string, number> = {
-  openrouter: 7,
-  kilol: 5,
-  pollinations: 3,
-  gemini: 1,
+  groq: 5,
+  cerebras: 2,
+  gemini: 3,
   zai: 1,
-  sambanova: 1,
+  openrouter: 1,
+  sambanova: 2,
+  pollinations: 4,
   cloudflare: 1,
-  groq: 1,
-  cerebras: 0,
-  ovh: 0,
+  ovh: 2,
+  kilol: 6,
 };
 
 /** The provider each manifest row is planned to use: index -> provider id. */
@@ -209,44 +209,45 @@ function candidatesFor(requires: Requirement): Candidate[] {
 /**
  * Plan one provider per manifest row so the whole trial spends exactly its 20 planned calls.
  *
- * Every provider's first call is safe (a drawn fail_calls entry is always >= 2), so the plan puts
- * the 20 calls where they were cheapest in risk and best in quality. The assignment is the exact
- * optimum of a maximum-weight bipartite matching between rows and provider call slots
- * (Hungarian algorithm), which is deterministic for a given rating table and manifest.
+ * Call 1 of every provider is safe (a drawn fail_calls entry is always >= 2), and each provider
+ * has a budget of safe calls before its first refusal; PLAN_CAPS records how many calls each one
+ * can take. Rows with the fewest eligible providers are placed first, and each takes the
+ * best-rated model on a provider that still has budget left, so no row is left without a route.
  */
 function planRoutes(): void {
   const manifest = brief.workload?.manifest ?? [];
   if (manifest.length === 0) return;
-  const slots: string[] = [];
+  const used = new Map<string, number>();
+  const order = manifest
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      const aCount = eligibleProviders(a.row.requires).length;
+      const bCount = eligibleProviders(b.row.requires).length;
+      if (aCount !== bCount) return aCount - bCount;
+      if (a.row.weight !== b.row.weight) return b.row.weight - a.row.weight;
+      return a.index - b.index;
+    });
+  for (const { row, index } of order) {
+    const options = candidatesFor(row.requires).filter((c) => {
+      const id = c.probe.provider.id;
+      return (used.get(id) ?? 0) < (PLAN_CAPS[id] ?? 1);
+    });
+    const pick = options[0];
+    if (pick === undefined) continue;
+    const id = pick.probe.provider.id;
+    plannedProvider[index] = id;
+    used.set(id, (used.get(id) ?? 0) + 1);
+  }
+}
+
+/** How many providers serve a free model that meets one row's requirements. */
+function eligibleProviders(requires: Requirement): string[] {
+  const ids = new Set<string>();
   for (const probe of probes) {
     if (!probe.ok) continue;
-    const id = probe.provider.id;
-    for (let i = 0; i < (PLAN_CAPS[id] ?? 1); i += 1) slots.push(id);
+    if (bestModelFor(probe.provider.id, requires) !== null) ids.add(probe.provider.id);
   }
-  if (slots.length < manifest.length) return;
-
-  const n = Math.max(manifest.length, slots.length);
-  const BIG = 1_000_000_000;
-  const value = (rowIndex: number, slotIndex: number): number => {
-    if (slotIndex >= slots.length) return BIG;
-    const row = manifest[rowIndex];
-    const best = bestModelFor(slots[slotIndex]!, row.requires);
-    return best === null ? BIG : row.weight * best.rating * 1000 + best.rating;
-  };
-  // Hungarian on a square matrix; cost = BIG - value so minimising cost maximises value.
-  const cost: number[][] = [];
-  for (let i = 0; i < n; i += 1) {
-    const line: number[] = [];
-    for (let j = 0; j < n; j += 1) line.push(i < manifest.length ? BIG - value(i, j) : BIG);
-    cost.push(line);
-  }
-  const match = hungarian(cost);
-  for (let i = 0; i < manifest.length; i += 1) {
-    const slot = match[i];
-    if (slot === undefined || slot < 0 || slot >= slots.length) continue;
-    if (value(i, slot) >= BIG) continue;
-    plannedProvider[i] = slots[slot]!;
-  }
+  return [...ids];
 }
 
 /** The best-rated free model a provider serves for one row, or null when it serves none. */
@@ -264,60 +265,6 @@ function bestModelFor(providerId: string, requires: Requirement): { id: string; 
     }
   }
   return best;
-}
-
-/** Minimum-cost assignment of a square matrix (Hungarian / Kuhn–Munkres), rows to columns. */
-function hungarian(cost: number[][]): number[] {
-  const n = cost.length;
-  const u = new Array<number>(n + 1).fill(0);
-  const v = new Array<number>(n + 1).fill(0);
-  const p = new Array<number>(n + 1).fill(0);
-  const way = new Array<number>(n + 1).fill(0);
-  const INF = Number.POSITIVE_INFINITY;
-  for (let i = 1; i <= n; i += 1) {
-    p[0] = i;
-    let j0 = 0;
-    const minv = new Array<number>(n + 1).fill(INF);
-    const used = new Array<boolean>(n + 1).fill(false);
-    do {
-      used[j0] = true;
-      const i0 = p[j0]!;
-      let delta = INF;
-      let j1 = 0;
-      for (let j = 1; j <= n; j += 1) {
-        if (used[j] === true) continue;
-        const cur = (cost[i0 - 1]?.[j - 1] ?? INF) - u[i0]! - v[j]!;
-        if (cur < minv[j]!) {
-          minv[j] = cur;
-          way[j] = j0;
-        }
-        if (minv[j]! < delta) {
-          delta = minv[j]!;
-          j1 = j;
-        }
-      }
-      for (let j = 0; j <= n; j += 1) {
-        if (used[j] === true) {
-          u[p[j]!] = u[p[j]!]! + delta;
-          v[j] = v[j]! - delta;
-        } else {
-          minv[j] = minv[j]! - delta;
-        }
-      }
-      j0 = j1;
-    } while (p[j0] !== 0);
-    while (j0 !== 0) {
-      const j1 = way[j0]!;
-      p[j0] = p[j1]!;
-      j0 = j1;
-    }
-  }
-  const assign = new Array<number>(n).fill(-1);
-  for (let j = 1; j <= n; j += 1) {
-    const row = p[j]!;
-    if (row > 0 && row <= n) assign[row - 1] = j - 1;
-  }
-  return assign;
 }
 
 /** Put the row's planned provider first, then the rest by the usual ranking. */
