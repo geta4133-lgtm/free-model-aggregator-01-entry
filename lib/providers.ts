@@ -141,6 +141,12 @@ export interface Probe {
   error: string | null;
 }
 
+/** Helper for calculating exponential backoff delay based on retry attempt */
+export function calculateBackoffDelay(attempt: number, baseMs = 50, maxMs = 500): number {
+  const delay = baseMs * Math.pow(2, attempt);
+  return Math.min(delay, maxMs);
+}
+
 /** Check if a model fulfills the request capabilities requirements */
 export function validateCandidateRequirements(requires: Requirement, caps: Capabilities): boolean {
   return meetsRequirements(requires, caps);
