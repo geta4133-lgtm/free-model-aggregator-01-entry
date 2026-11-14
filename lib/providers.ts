@@ -398,17 +398,24 @@ function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
   });
 }
 
-/** Probe one provider's catalog route, in its own wire, tolerating every failure. */
+/** One provider's catalog probe, in its own wire, tolerating every failure and extracting models. */
 export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
   const base = joinBase(envUrl, provider.base);
   const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
+  const headers: Record<string, string> = {
+    accept: 'application/json',
+    ...authHeaders(provider.auth, provider.key)
+  };
   if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+
   try {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
+    if (!res.ok) {
+      return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
+    }
     const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
+    const models = modelsIn(provider.wire, body);
+    return { provider, ok: true, status: res.status, models, error: null };
   } catch (err) {
     return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
   }
@@ -429,13 +436,23 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    // Sort models deterministically by ID
+    const sorted = [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const model of sorted) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+      const isFree = modelFree(model, row);
+      const ctx = row?.context_length ?? model.context_length ?? null;
+      models.push({ id: model.id, free: isFree, context_length: ctx });
     }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
+    providers.push({
+      id: probe.provider.id,
+      base_url: probe.provider.base,
+      key_env: probe.provider.key_env,
+      wire: probe.provider.wire,
+      models
+    });
   }
   return { providers };
 }
