@@ -317,7 +317,16 @@ export function readBrief(path: string): Brief {
 /** The rating row of one provider's model, when the quality table has one. */
 export function ratingOfModel(ratings: RatingsFile | null, providerId: string, modelId: string): RatingRow | null {
   if (ratings === null) return null;
-  return ratings.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
+  // Match provider and model id exactly, or handle provider-prefixed model names
+  const direct = ratings.ratings.find((r) => r.provider === providerId && r.model === modelId);
+  if (direct !== undefined) return direct;
+  const prefix = `${providerId}/`;
+  if (modelId.startsWith(prefix)) {
+    const stripped = modelId.slice(prefix.length);
+    const sub = ratings.ratings.find((r) => r.provider === providerId && r.model === stripped);
+    if (sub !== undefined) return sub;
+  }
+  return null;
 }
 
 /**
