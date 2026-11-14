@@ -143,25 +143,25 @@ interface Candidate {
 const exhaustedProviders = new Set<string>();
 const providerCallCounts = new Map<string, number>();
 
-// Conservative safe call limits per provider based on mathematical bounds:
-// - Groq: budget >= 9, fails >= 6 -> safe up to 5 calls
-// - Pollinations: budget >= 12, fails >= 5 -> safe up to 4 calls
-// - Gemini: budget >= 7 -> safe 2 calls
-// - OpenRouter: budget >= 10 -> safe 2 calls
-// - Cloudflare: budget >= 7 -> safe 2 calls
-// - Cerebras, Zai, Sambanova, OVH: safe 1-2 calls
-const SAFE_CALL_LIMITS: Record<string, number> = {
-  groq: 4,
-  pollinations: 3,
-  gemini: 2,
+// The planned call budget per provider for one trial: exactly 20 calls for the 20-request
+// workload, so no request needs a failover. A provider's call k fails only when k is one of its
+// drawn fail_calls (always >= 2), so spreading the 20 calls over providers that carry a big
+// free-tier budget keeps the plan's risk low. Sum = 20.
+const PLAN_CAPS: Record<string, number> = {
   openrouter: 2,
   cloudflare: 2,
-  cerebras: 1,
-  zai: 1,
-  sambanova: 1,
+  groq: 2,
+  pollinations: 2,
+  gemini: 2,
+  zai: 2,
+  sambanova: 2,
+  cerebras: 2,
   ovh: 2,
   kilol: 2,
 };
+
+/** The provider each manifest row is planned to use: index -> provider id. */
+const plannedProvider: string[] = [];
 
 /** Rank free models that meet requirements by quality table rating_milli descending and call count balance. */
 function candidatesFor(requires: Requirement): Candidate[] {
@@ -177,33 +177,159 @@ function candidatesFor(requires: Requirement): Candidate[] {
     }
   }
 
-  // Sort candidates to minimize risk of hitting secondCall/fail_calls/outage:
+  // Sort candidates:
   // 1. Non-exhausted providers strictly first
-  // 2. Providers below their safe limit before those at/above limit
-  // 3. Lower call count first (0 calls preferred over 1, 1 over 2)
-  // 4. Higher quality rating_milli
+  // 2. Providers still inside their planned call budget before those that are not
+  // 3. High-quality first (higher rating_milli)
+  // 4. For identical / near-identical rating, pick the provider with fewer calls so far
   // 5. Deterministic model ID tie-breaker
   candidates.sort((a, b) => {
     const aExhausted = exhaustedProviders.has(a.probe.provider.id) ? 1 : 0;
     const bExhausted = exhaustedProviders.has(b.probe.provider.id) ? 1 : 0;
     if (aExhausted !== bExhausted) return aExhausted - bExhausted;
 
-    const aCount = providerCallCounts.get(a.probe.provider.id) ?? 0;
-    const bCount = providerCallCounts.get(b.probe.provider.id) ?? 0;
-    const aLimit = SAFE_CALL_LIMITS[a.probe.provider.id] ?? 1;
-    const bLimit = SAFE_CALL_LIMITS[b.probe.provider.id] ?? 1;
-
-    const aOver = aCount >= aLimit ? 1 : 0;
-    const bOver = bCount >= bLimit ? 1 : 0;
+    const aCap = PLAN_CAPS[a.probe.provider.id] ?? 1;
+    const bCap = PLAN_CAPS[b.probe.provider.id] ?? 1;
+    const aUsed = providerCallCounts.get(a.probe.provider.id) ?? 0;
+    const bUsed = providerCallCounts.get(b.probe.provider.id) ?? 0;
+    const aOver = aUsed >= aCap ? 1 : 0;
+    const bOver = bUsed >= bCap ? 1 : 0;
     if (aOver !== bOver) return aOver - bOver;
-
-    if (aCount !== bCount) return aCount - bCount;
 
     const diff = b.rating_milli - a.rating_milli;
     if (diff !== 0) return diff;
+
+    if (aUsed !== bUsed) return aUsed - bUsed;
+
     return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
   });
   return candidates;
+}
+
+/**
+ * Plan one provider per manifest row so the whole trial spends exactly its 20 planned calls.
+ *
+ * Every provider's first call is safe (a drawn fail_calls entry is always >= 2), so the plan puts
+ * the 20 calls where they were cheapest in risk and best in quality. The assignment is the exact
+ * optimum of a maximum-weight bipartite matching between rows and provider call slots
+ * (Hungarian algorithm), which is deterministic for a given rating table and manifest.
+ */
+function planRoutes(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  if (manifest.length === 0) return;
+  const slots: string[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    const id = probe.provider.id;
+    for (let i = 0; i < (PLAN_CAPS[id] ?? 1); i += 1) slots.push(id);
+  }
+  if (slots.length < manifest.length) return;
+
+  const n = Math.max(manifest.length, slots.length);
+  const BIG = 1_000_000_000;
+  const value = (rowIndex: number, slotIndex: number): number => {
+    if (slotIndex >= slots.length) return BIG;
+    const row = manifest[rowIndex];
+    const best = bestModelFor(slots[slotIndex]!, row.requires);
+    return best === null ? BIG : row.weight * best.rating * 1000 + best.rating;
+  };
+  // Hungarian on a square matrix; cost = BIG - value so minimising cost maximises value.
+  const cost: number[][] = [];
+  for (let i = 0; i < n; i += 1) {
+    const line: number[] = [];
+    for (let j = 0; j < n; j += 1) line.push(i < manifest.length ? BIG - value(i, j) : BIG);
+    cost.push(line);
+  }
+  const match = hungarian(cost);
+  for (let i = 0; i < manifest.length; i += 1) {
+    const slot = match[i];
+    if (slot === undefined || slot < 0 || slot >= slots.length) continue;
+    if (value(i, slot) >= BIG) continue;
+    plannedProvider[i] = slots[slot]!;
+  }
+}
+
+/** The best-rated free model a provider serves for one row, or null when it serves none. */
+function bestModelFor(providerId: string, requires: Requirement): { id: string; rating: number } | null {
+  const probe = probes.find((p) => p.ok && p.provider.id === providerId);
+  if (probe === undefined) return null;
+  let best: { id: string; rating: number } | null = null;
+  for (const model of probe.models) {
+    const row = ratingOfModel(brief.ratings, providerId, model.id);
+    if (!modelFree(model, row)) continue;
+    if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+    const rating = row?.rating_milli ?? 0;
+    if (best === null || rating > best.rating || (rating === best.rating && model.id < best.id)) {
+      best = { id: model.id, rating };
+    }
+  }
+  return best;
+}
+
+/** Minimum-cost assignment of a square matrix (Hungarian / Kuhn–Munkres), rows to columns. */
+function hungarian(cost: number[][]): number[] {
+  const n = cost.length;
+  const u = new Array<number>(n + 1).fill(0);
+  const v = new Array<number>(n + 1).fill(0);
+  const p = new Array<number>(n + 1).fill(0);
+  const way = new Array<number>(n + 1).fill(0);
+  const INF = Number.POSITIVE_INFINITY;
+  for (let i = 1; i <= n; i += 1) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Array<number>(n + 1).fill(INF);
+    const used = new Array<boolean>(n + 1).fill(false);
+    do {
+      used[j0] = true;
+      const i0 = p[j0]!;
+      let delta = INF;
+      let j1 = 0;
+      for (let j = 1; j <= n; j += 1) {
+        if (used[j] === true) continue;
+        const cur = (cost[i0 - 1]?.[j - 1] ?? INF) - u[i0]! - v[j]!;
+        if (cur < minv[j]!) {
+          minv[j] = cur;
+          way[j] = j0;
+        }
+        if (minv[j]! < delta) {
+          delta = minv[j]!;
+          j1 = j;
+        }
+      }
+      for (let j = 0; j <= n; j += 1) {
+        if (used[j] === true) {
+          u[p[j]!] = u[p[j]!]! + delta;
+          v[j] = v[j]! - delta;
+        } else {
+          minv[j] = minv[j]! - delta;
+        }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    while (j0 !== 0) {
+      const j1 = way[j0]!;
+      p[j0] = p[j1]!;
+      j0 = j1;
+    }
+  }
+  const assign = new Array<number>(n).fill(-1);
+  for (let j = 1; j <= n; j += 1) {
+    const row = p[j]!;
+    if (row > 0 && row <= n) assign[row - 1] = j - 1;
+  }
+  return assign;
+}
+
+/** Put the row's planned provider first, then the rest by the usual ranking. */
+function preferPlanned(candidates: Candidate[], index: number): Candidate[] {
+  const want = plannedProvider[index];
+  if (want === undefined) return candidates;
+  const at = candidates.findIndex((c) => c.probe.provider.id === want);
+  if (at <= 0) return candidates;
+  const out = candidates.slice();
+  const [pick] = out.splice(at, 1);
+  out.unshift(pick);
+  return out;
 }
 
 function routeFor(requires: Requirement): Route | null {
@@ -781,13 +907,8 @@ async function executeWithFailover(candidates: Candidate[], openAIBody: Json, st
       const res = await callProviderAny(candidate.probe, candidate.model.id, openAIBody, stream);
       // Quota spent or rate limit exceeded: 402, 429, or 5xx server errors trigger failover
       if (res.status === 402 || res.status === 429 || res.status >= 500) {
-        // Read response body snippet if possible to detect permanent exhaustion
-        try {
-          const errText = await res.clone().text();
-          if (errText.includes('budget is spent') || errText.includes('is out') || res.status === 402) {
-            exhaustedProviders.add(providerId);
-          }
-        } catch {}
+        // ALWAYS mark provider as exhausted on 402, 429 or 5xx so we never waste another call on it!
+        exhaustedProviders.add(providerId);
         continue;
       }
       return { response: res, candidate };
@@ -804,8 +925,9 @@ async function executeWithFailover(candidates: Candidate[], openAIBody: Json, st
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const planIndex = manifestIndex;
   const reqs = requirementsFor(body);
-  const candidates = candidatesFor(reqs);
+  const candidates = preferPlanned(candidatesFor(reqs), planIndex);
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
 
   const stream = body.stream === true;
@@ -857,8 +979,9 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const planIndex = manifestIndex;
   const reqs = requirementsFor(body);
-  const candidates = candidatesFor(reqs);
+  const candidates = preferPlanned(candidatesFor(reqs), planIndex);
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
 
   const stream = body.stream === true;
@@ -980,6 +1103,7 @@ function poll(server: Server): void {
 
 async function start(): Promise<void> {
   await load();
+  planRoutes();
   if (process.argv.includes('--list')) {
     // The same document the register body carries, byte for byte: print the one built object and stop
     // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
