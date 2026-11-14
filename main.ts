@@ -279,6 +279,38 @@ function preferPlanned(candidates: Candidate[], index: number): Candidate[] {
   return out;
 }
 
+/**
+ * Re-plan the rows still to come once a provider has died.
+ *
+ * The plan made at start assumes every provider answers its planned calls. When one refuses, its
+ * remaining calls are worthless, so the rows after this one are re-planned over the providers that
+ * are still alive and still under their measured budget: the survivors' capacity is spent evenly
+ * instead of one favourite being drained first and cascading.
+ */
+function replanFrom(startIndex: number): void {
+  const manifest = brief.workload?.manifest ?? [];
+  const pending = manifest
+    .map((row, index) => ({ row, index }))
+    .filter((entry) => entry.index > startIndex)
+    .sort((a, b) => {
+      const aCount = eligibleProviders(a.row.requires).length;
+      const bCount = eligibleProviders(b.row.requires).length;
+      if (aCount !== bCount) return aCount - bCount;
+      if (a.row.weight !== b.row.weight) return b.row.weight - a.row.weight;
+      return a.index - b.index;
+    });
+  for (const { row, index } of pending) {
+    const options = candidatesFor(row.requires).filter((c) => {
+      const id = c.probe.provider.id;
+      if (exhaustedProviders.has(id)) return false;
+      return (providerCallCounts.get(id) ?? 0) < (PLAN_CAPS[id] ?? 1);
+    });
+    const pick = options[0];
+    if (pick === undefined) continue;
+    plannedProvider[index] = pick.probe.provider.id;
+  }
+}
+
 function routeFor(requires: Requirement): Route | null {
   const candidates = candidatesFor(requires);
   if (candidates.length === 0) return null;
@@ -839,7 +871,7 @@ async function* geminiStreamToAnthropic(stream: ReadableStream<Uint8Array>, mode
 }
 
 /** Execute request with quality ranking and automatic quota/error failover */
-async function executeWithFailover(candidates: Candidate[], openAIBody: Json, stream: boolean): Promise<{ response: Response; candidate: Candidate } | null> {
+async function executeWithFailover(candidates: Candidate[], openAIBody: Json, stream: boolean, planIndex: number): Promise<{ response: Response; candidate: Candidate } | null> {
   for (const candidate of candidates) {
     const providerId = candidate.probe.provider.id;
     // Skip providers that are already marked permanently exhausted/outage
@@ -856,12 +888,14 @@ async function executeWithFailover(candidates: Candidate[], openAIBody: Json, st
       if (res.status === 402 || res.status === 429 || res.status >= 500) {
         // ALWAYS mark provider as exhausted on 402, 429 or 5xx so we never waste another call on it!
         exhaustedProviders.add(providerId);
+        replanFrom(planIndex);
         continue;
       }
       return { response: res, candidate };
     } catch {
       // Network drop or unreachable: try next candidate
       exhaustedProviders.add(providerId);
+      replanFrom(planIndex);
       continue;
     }
   }
@@ -878,7 +912,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
 
   const stream = body.stream === true;
-  const result = await executeWithFailover(candidates, body, stream);
+  const result = await executeWithFailover(candidates, body, stream, planIndex);
   if (result === null) {
     return sendError(res, 'openai', 503, 'upstream_exhausted', 'all candidate models failed or exhausted quota');
   }
@@ -937,7 +971,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const openAIBody = anthropicToOpenAI(body, requestedModel);
 
   // If candidate is already Anthropic wire, we can send original body directly!
-  const result = await executeWithFailover(candidates, openAIBody, stream);
+  const result = await executeWithFailover(candidates, openAIBody, stream, planIndex);
   if (result === null) {
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'all candidate models failed or exhausted quota');
   }
