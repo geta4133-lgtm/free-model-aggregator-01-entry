@@ -148,16 +148,16 @@ const providerCallCounts = new Map<string, number>();
 // drawn fail_calls (always >= 2), so spreading the 20 calls over providers that carry a big
 // free-tier budget keeps the plan's risk low. Sum = 20.
 const PLAN_CAPS: Record<string, number> = {
-  openrouter: 5,
-  kilol: 4,
-  pollinations: 4,
+  openrouter: 7,
+  kilol: 5,
+  pollinations: 3,
   gemini: 1,
   zai: 1,
   sambanova: 1,
   cloudflare: 1,
   groq: 1,
-  cerebras: 1,
-  ovh: 1,
+  cerebras: 0,
+  ovh: 0,
 };
 
 /** The provider each manifest row is planned to use: index -> provider id. */
