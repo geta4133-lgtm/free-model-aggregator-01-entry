@@ -16,9 +16,12 @@
 // provider on either): a real entry needs their request and event shapes too, which is the biggest single
 // gap in this starter.
 //
-// Everything here is a pure function of its arguments: no clock and no randomness, so the same body and the
-// same provider answer give the same bytes on a replay. The two model listings use fixed timestamps for the
-// same reason: a `created` that moved between runs would be a nondeterministic document.
+// Pure wire transformation functions for streaming and non-streaming APIs
+export interface ToolCallItem {
+  id: string;
+  name: string;
+  arguments: string;
+}
 
 import { isRecord, type Json } from './providers.ts';
 
