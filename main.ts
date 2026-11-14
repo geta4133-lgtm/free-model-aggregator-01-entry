@@ -153,7 +153,11 @@ function candidatesFor(requires: Requirement): Candidate[] {
     }
   }
   // Sort descending by quality rating
-  candidates.sort((a, b) => b.rating_milli - a.rating_milli);
+  candidates.sort((a, b) => {
+    const diff = b.rating_milli - a.rating_milli;
+    if (diff !== 0) return diff;
+    return a.model.id < b.model.id ? -1 : 1;
+  });
   return candidates;
 }
 
@@ -800,6 +804,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0].model.id;
   const openAIBody = anthropicToOpenAI(body, requestedModel);
 
+  // If candidate is already Anthropic wire, we can send original body directly!
   const result = await executeWithFailover(candidates, openAIBody, stream);
   if (result === null) {
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'all candidate models failed or exhausted quota');
@@ -835,8 +840,12 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
   }
 
-  const jsonVal: unknown = await upstream.json();
-  const parsedObj = isRecord(jsonVal) ? jsonVal : {};
+  const textResp = await upstream.text();
+  let parsedObj: Json = {};
+  try {
+    parsedObj = JSON.parse(textResp);
+  } catch {}
+
   if (wire === 'openai') {
     sendJson(res, 200, openAIToAnthropic(parsedObj, requestedModel));
   } else if (wire === 'gemini') {
