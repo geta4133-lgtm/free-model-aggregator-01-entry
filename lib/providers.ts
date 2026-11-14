@@ -187,6 +187,266 @@ export function authHeaders(auth: AuthScheme, key: string): Record<string, strin
   return {};
 }
 
+/** Check if status code indicates a retryable rate limit or transient error */
+export function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+/** Parse boolean flag safely from unknown string or boolean value */
+export function parseBooleanFlag(val: unknown): boolean {
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'string') return val.toLowerCase() === 'true' || val === '1';
+  return false;
+}
+
+/** Extract error message safely from provider error response payload */
+export function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (!isRecord(payload)) return fallback;
+  if (typeof payload.message === 'string') return payload.message;
+  if (isRecord(payload.error) && typeof payload.error.message === 'string') return payload.error.message;
+  return fallback;
+}
+
+/** Check if provider wire format is OpenAI-compatible */
+export function isOpenAICompatibleWire(wire: string): boolean {
+  return wire === 'openai';
+}
+
+/** Check if provider wire format is Anthropic-native */
+export function isAnthropicWire(wire: string): boolean {
+  return wire === 'anthropic';
+}
+
+/** Check if provider wire format is Google Gemini */
+export function isGeminiWire(wire: string): boolean {
+  return wire === 'gemini';
+}
+
+/** Extract prompt tokens from usage object or return 0 */
+export function promptTokensOf(usage: unknown): number {
+  if (!isRecord(usage)) return 0;
+  return typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0;
+}
+
+/** Extract completion tokens from usage object or return 0 */
+export function completionTokensOf(usage: unknown): number {
+  if (!isRecord(usage)) return 0;
+  return typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0;
+}
+
+/** Compute total tokens from prompt and completion token counts */
+export function totalTokensOf(prompt: number, completion: number): number {
+  return prompt + completion;
+}
+
+/** Check if model name contains reasoning or thinking keywords */
+export function isReasoningModel(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return lower.includes('reason') || lower.includes('think') || lower.includes('r1') || lower.includes('o1');
+}
+
+/** Check if model name contains vision or multimodal keywords */
+export function isVisionModel(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return lower.includes('vision') || lower.includes('vl') || lower.includes('4o') || lower.includes('flash');
+}
+
+/** Format model display name neatly for catalog endpoints */
+export function formatModelDisplayName(modelId: string): string {
+  const parts = modelId.split('/');
+  return parts[parts.length - 1] ?? modelId;
+}
+
+/** Build a fallback model candidate when catalog lookup yields no match */
+export function buildFallbackModel(modelId: string, providerId = 'default'): ProbedModel {
+  return {
+    id: modelId,
+    display_name: formatModelDisplayName(modelId),
+    free: true,
+    context_length: 8192,
+    tools: true,
+    vision: false,
+    json: true
+  };
+}
+
+/** Check if string is non-empty trimmed content */
+export function isNonEmptyString(val: unknown): val is string {
+  return typeof val === 'string' && val.trim().length > 0;
+}
+
+/** Filter valid candidate models that satisfy context window requirements */
+export function filterCandidatesByContext(models: ProbedModel[], minContext: number): ProbedModel[] {
+  return models.filter((m) => (m.context_length ?? 0) >= minContext);
+}
+
+/** Filter valid candidate models that satisfy tool-calling support */
+export function filterCandidatesByTools(models: ProbedModel[]): ProbedModel[] {
+  return models.filter((m) => m.tools !== false);
+}
+
+/** Filter valid candidate models that satisfy vision and image support */
+export function filterCandidatesByVision(models: ProbedModel[]): ProbedModel[] {
+  return models.filter((m) => m.vision === true);
+}
+
+/** Extract timeout limit in milliseconds from request header or query */
+export function extractTimeoutMs(val: unknown, fallbackMs = 30000): number {
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) return val;
+  if (typeof val === 'string') {
+    const parsed = parseInt(val, 10);
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return fallbackMs;
+}
+
+/** Determine whether candidate should failover on specific HTTP status code */
+export function shouldFailover(status: number): boolean {
+  return status === 402 || status === 429 || status >= 500;
+}
+
+/** Compare two models by context window capacity descending */
+export function compareByContextLength(a: ProbedModel, b: ProbedModel): number {
+  const ca = a.context_length ?? 0;
+  const cb = b.context_length ?? 0;
+  return cb - ca;
+}
+
+/** Check if candidate array has at least one valid item */
+export function hasCandidates(candidates: unknown[]): boolean {
+  return Array.isArray(candidates) && candidates.length > 0;
+}
+
+/** Sanitize input string by removing control characters */
+export function sanitizeHeaderString(val: string): string {
+  return val.replace(/[\r\n\t]/g, ' ').trim();
+}
+
+/** Build request authorization header based on API key and provider auth scheme */
+export function buildAuthHeaderValue(auth: AuthScheme, key: string): string | null {
+  if (key === '') return null;
+  if (auth === 'bearer') return `Bearer ${key}`;
+  return key;
+}
+
+/** Format error object into standard JSON response body format */
+export function formatStandardErrorPayload(message: string, code: string | number = 500): Json {
+  return {
+    error: {
+      message,
+      code,
+      type: 'invalid_request_error'
+    }
+  };
+}
+
+/** Parse content type header into mime and charset parts */
+export function parseContentTypeHeader(header: string | undefined): { mime: string; charset: string } {
+  if (!header) return { mime: 'application/json', charset: 'utf-8' };
+  const parts = header.split(';');
+  const mime = parts[0]?.trim().toLowerCase() ?? 'application/json';
+  let charset = 'utf-8';
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i]?.trim().toLowerCase() ?? '';
+    if (p.startsWith('charset=')) {
+      charset = p.slice(8).trim();
+    }
+  }
+  return { mime, charset };
+}
+
+/** Check if HTTP method allows a request body */
+export function httpMethodHasBody(method: string | undefined): boolean {
+  if (!method) return false;
+  const m = method.toUpperCase();
+  return m === 'POST' || m === 'PUT' || m === 'PATCH';
+}
+
+/** Extract bearer token from raw authorization header string */
+export function extractBearerToken(header: string | undefined): string | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (trimmed.toLowerCase().startsWith('bearer ')) {
+    return trimmed.slice(7).trim();
+  }
+  return null;
+}
+
+/** Create simple status response object */
+export function createStatusResponse(ok: boolean, status: number, details: string): Json {
+  return {
+    ok,
+    status,
+    details
+  };
+}
+
+/** Calculate percentage ratio between numerator and denominator */
+export function calculatePercentage(part: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.round((part / total) * 10000) / 100;
+}
+
+/** Check if array has duplicate string elements */
+export function hasDuplicateStrings(arr: string[]): boolean {
+  return new Set(arr).size !== arr.length;
+}
+
+/** Deduplicate string array preserving original insertion order */
+export function deduplicateStrings(arr: string[]): string[] {
+  return [...new Set(arr)];
+}
+
+/** Clamp integer value between minimum and maximum bounds */
+export function clampInteger(val: number, min: number, max: number): number {
+  return Math.min(Math.max(val, min), max);
+}
+
+/** Check if provider key environment variable name is valid identifier */
+export function isValidEnvVarName(name: string): boolean {
+  return /^[A-Z_][A-Z0-9_]*$/.test(name);
+}
+
+/** Create fallback JSON response headers for streaming or REST responses */
+export function standardJsonHeaders(): Record<string, string> {
+  return {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': '*',
+    'access-control-allow-methods': 'GET, POST, OPTIONS'
+  };
+}
+
+/** Format timestamp in milliseconds to ISO 8601 string format */
+export function formatIsoTimestamp(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+/** Check if value is a finite positive integer */
+export function isPositiveInteger(val: unknown): val is number {
+  return typeof val === 'number' && Number.isInteger(val) && val > 0;
+}
+
+/** Check if value is a valid non-empty array of objects */
+export function isNonEmptyObjectArray(val: unknown): val is Record<string, unknown>[] {
+  return Array.isArray(val) && val.length > 0 && val.every((item) => isRecord(item));
+}
+
+/** Extract integer value safely or return default fallback */
+export function safeIntegerOrFallback(val: unknown, fallback: number): number {
+  if (typeof val === 'number' && Number.isFinite(val)) return Math.floor(val);
+  if (typeof val === 'string') {
+    const parsed = parseInt(val, 10);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+/** Convert string array to set for quick lookup membership */
+export function stringArrayToLookupSet(items: readonly string[]): Set<string> {
+  return new Set(items);
+}
+
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
 function documentsIn(text: string): Json[] {
   const out: Json[] = [];
