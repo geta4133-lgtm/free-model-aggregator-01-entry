@@ -224,15 +224,171 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** POST one request to the routed provider's Chat Completions route. */
-async function callProvider(route: Route, body: Json): Promise<Response> {
-  const base = joinBase(ENV_URL, route.probe.provider.base);
+// Full Multi-Wire Upstream Caller & Protocol Transformer
+
+/** Convert OpenAI body to Gemini generateContent request body */
+function openAIToGemini(body: Json): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  let systemInstruction: Json | undefined = undefined;
+  const contents: Json[] = [];
+
+  for (const m of messages) {
+    if (!isRecord(m)) continue;
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content : '';
+      if (text !== '') systemInstruction = { parts: [{ text }] };
+    } else if (m.role === 'user' || m.role === 'assistant') {
+      const parts: Json[] = [];
+      if (typeof m.content === 'string') {
+        parts.push({ text: m.content });
+      } else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (!isRecord(part)) continue;
+          if (part.type === 'text' && typeof part.text === 'string') {
+            parts.push({ text: part.text });
+          } else if (part.type === 'image_url' && isRecord(part.image_url) && typeof part.image_url.url === 'string') {
+            const url = part.image_url.url;
+            if (url.startsWith('data:')) {
+              const comma = url.indexOf(',');
+              const meta = url.slice(5, comma);
+              const data = url.slice(comma + 1);
+              const mime = meta.split(';')[0] || 'image/png';
+              parts.push({ inlineData: { mimeType: mime, data } });
+            } else {
+              parts.push({ fileData: { fileUri: url, mimeType: 'image/png' } });
+            }
+          }
+        }
+      }
+      contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts });
+    }
+  }
+
+  const out: Json = { contents };
+  if (systemInstruction !== undefined) out.systemInstruction = systemInstruction;
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const fns: Json[] = [];
+    for (const t of body.tools) {
+      if (isRecord(t) && isRecord(t.function) && typeof t.function.name === 'string') {
+        fns.push({
+          name: t.function.name,
+          description: typeof t.function.description === 'string' ? t.function.description : '',
+          parameters: isRecord(t.function.parameters) ? t.function.parameters : { type: 'object' }
+        });
+      }
+    }
+    if (fns.length > 0) out.tools = [{ functionDeclarations: fns }];
+  }
+
+  const generationConfig: Json = {};
+  if (typeof body.max_tokens === 'number') generationConfig.maxOutputTokens = body.max_tokens;
+  if (typeof body.temperature === 'number') generationConfig.temperature = body.temperature;
+  if (typeof body.top_p === 'number') generationConfig.topP = body.top_p;
+  if (Array.isArray(body.stop)) generationConfig.stopSequences = body.stop;
+  if (isRecord(body.response_format)) {
+    const type = body.response_format.type;
+    if (type === 'json_object' || type === 'json_schema') {
+      generationConfig.responseMimeType = 'application/json';
+    }
+  }
+  if (Object.keys(generationConfig).length > 0) out.generationConfig = generationConfig;
+
+  return out;
+}
+
+/** Convert OpenAI body to Anthropic Messages request body */
+function openAIToAnthropicMessages(body: Json, model: string): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  let systemText = '';
+  const anthropicMessages: Json[] = [];
+
+  for (const m of messages) {
+    if (!isRecord(m)) continue;
+    if (m.role === 'system') {
+      const text = typeof m.content === 'string' ? m.content : '';
+      if (text !== '') systemText = systemText === '' ? text : `${systemText}\n${text}`;
+    } else if (m.role === 'user' || m.role === 'assistant') {
+      const content: Json[] = [];
+      if (typeof m.content === 'string') {
+        content.push({ type: 'text', text: m.content });
+      } else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (!isRecord(part)) continue;
+          if (part.type === 'text' && typeof part.text === 'string') {
+            content.push({ type: 'text', text: part.text });
+          } else if (part.type === 'image_url' && isRecord(part.image_url) && typeof part.image_url.url === 'string') {
+            const url = part.image_url.url;
+            if (url.startsWith('data:')) {
+              const comma = url.indexOf(',');
+              const meta = url.slice(5, comma);
+              const data = url.slice(comma + 1);
+              const mime = meta.split(';')[0] || 'image/png';
+              content.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });
+            } else {
+              content.push({ type: 'image', source: { type: 'url', url } });
+            }
+          }
+        }
+      }
+      anthropicMessages.push({ role: m.role, content });
+    }
+  }
+
+  const out: Json = { model, messages: anthropicMessages };
+  if (systemText !== '') out.system = systemText;
+  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
+  else out.max_tokens = 4096;
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.top_p === 'number') out.top_p = body.top_p;
+  if (Array.isArray(body.stop)) out.stop_sequences = body.stop;
+
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tools: Json[] = [];
+    for (const t of body.tools) {
+      if (isRecord(t) && isRecord(t.function) && typeof t.function.name === 'string') {
+        tools.push({
+          name: t.function.name,
+          description: typeof t.function.description === 'string' ? t.function.description : '',
+          input_schema: isRecord(t.function.parameters) ? t.function.parameters : { type: 'object' }
+        });
+      }
+    }
+    if (tools.length > 0) out.tools = tools;
+  }
+
+  return out;
+}
+
+/** Call provider on any wire (OpenAI, Anthropic, or Gemini) */
+async function callProviderAny(probe: Probe, modelId: string, openAIBody: Json, stream: boolean): Promise<Response> {
+  const base = joinBase(ENV_URL, probe.provider.base);
+  const wire = probe.provider.wire;
   const headers: Record<string, string> = {
     'content-type': 'application/json',
-    ...authHeaders(route.probe.provider.auth, route.probe.provider.key),
+    ...authHeaders(probe.provider.auth, probe.provider.key),
   };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (stream) headers.accept = 'text/event-stream';
+
+  if (wire === 'openai') {
+    const url = `${base}/v1/chat/completions`;
+    const payload = { ...openAIBody, model: modelId, stream };
+    return fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  }
+
+  if (wire === 'anthropic') {
+    const url = `${base}/v1/messages`;
+    if (!headers['anthropic-version']) headers['anthropic-version'] = '2023-06-01';
+    const payload = { ...openAIToAnthropicMessages(openAIBody, modelId), stream };
+    return fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  }
+
+  // Gemini wire
+  const action = stream ? 'streamGenerateContent' : 'generateContent';
+  let url = `${base}/v1beta/models/${modelId}:${action}`;
+  if (stream) url += '?alt=sse';
+  const payload = openAIToGemini(openAIBody);
+  return fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
 }
 
 /** Copy a provider's event stream to the client as it arrives. */
@@ -250,64 +406,395 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by an openai-wire provider. */
+// Response Converters: Gemini/Anthropic to OpenAI & Anthropic Clients
+
+/** Extract plain text from Gemini content parts */
+function geminiResponseText(body: Json): string {
+  if (!Array.isArray(body.candidates) || body.candidates.length === 0) return '';
+  const cand = body.candidates[0];
+  if (!isRecord(cand) || !isRecord(cand.content) || !Array.isArray(cand.content.parts)) return '';
+  const texts: string[] = [];
+  for (const p of cand.content.parts) {
+    if (isRecord(p) && typeof p.text === 'string') texts.push(p.text);
+  }
+  return texts.join('');
+}
+
+/** Convert Gemini non-streaming response to OpenAI Chat Completion format */
+function geminiToOpenAI(body: Json, model: string): Json {
+  const text = geminiResponseText(body);
+  const cand = Array.isArray(body.candidates) && isRecord(body.candidates[0]) ? body.candidates[0] : {};
+  let finish = 'stop';
+  if (cand.finishReason === 'MAX_TOKENS') finish = 'length';
+  const meta = isRecord(body.usageMetadata) ? body.usageMetadata : {};
+  const promptTokens = typeof meta.promptTokenCount === 'number' ? meta.promptTokenCount : 0;
+  const completionTokens = typeof meta.candidatesTokenCount === 'number' ? meta.candidatesTokenCount : 0;
+
+  return {
+    id: 'chatcmpl-gemini',
+    object: 'chat.completion',
+    created: 1767225600,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: text },
+        finish_reason: finish,
+        logprobs: null
+      }
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens
+    }
+  };
+}
+
+/** Convert Anthropic non-streaming response to OpenAI Chat Completion format */
+function anthropicToOpenAIResponse(body: Json, model: string): Json {
+  const content = Array.isArray(body.content) ? body.content : [];
+  let text = '';
+  const toolCalls: Json[] = [];
+
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'text' && typeof block.text === 'string') {
+      text += block.text;
+    } else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: typeof block.id === 'string' ? block.id : 'call_1',
+        type: 'function',
+        function: {
+          name: typeof block.name === 'string' ? block.name : '',
+          arguments: JSON.stringify(isRecord(block.input) ? block.input : {})
+        }
+      });
+    }
+  }
+
+  let finish = 'stop';
+  if (body.stop_reason === 'max_tokens') finish = 'length';
+  else if (body.stop_reason === 'tool_use') finish = 'tool_calls';
+
+  const usage = isRecord(body.usage) ? body.usage : {};
+  const promptTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const completionTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+
+  return {
+    id: `chatcmpl-${typeof body.id === 'string' ? body.id : 'anthropic'}`,
+    object: 'chat.completion',
+    created: 1767225600,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: text !== '' ? text : null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+        },
+        finish_reason: finish,
+        logprobs: null
+      }
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens
+    }
+  };
+}
+
+/** Convert Gemini SSE stream to OpenAI SSE chunks */
+async function* geminiStreamToOpenAI(stream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const chunk = (delta: Json, finish: string | null = null, usage: Json | null = null) => {
+    return `data: ${JSON.stringify({
+      id: 'chatcmpl-stream',
+      object: 'chat.completion.chunk',
+      created: 1767225600,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finish }],
+      ...(usage ? { usage } : {})
+    })}\n\n`;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const data: unknown = JSON.parse(payload);
+            if (isRecord(data)) {
+              const text = geminiResponseText(data);
+              if (text !== '') {
+                yield chunk({ content: text });
+              }
+              const cand = Array.isArray(data.candidates) && isRecord(data.candidates[0]) ? data.candidates[0] : null;
+              if (cand && cand.finishReason) {
+                const finish = cand.finishReason === 'MAX_TOKENS' ? 'length' : 'stop';
+                yield chunk({}, finish);
+              }
+            }
+          } catch {}
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  yield 'data: [DONE]\n\n';
+}
+
+/** Convert Anthropic SSE stream to OpenAI SSE chunks */
+async function* anthropicStreamToOpenAI(stream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const chunk = (delta: Json, finish: string | null = null) => {
+    return `data: ${JSON.stringify({
+      id: 'chatcmpl-stream',
+      object: 'chat.completion.chunk',
+      created: 1767225600,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finish }]
+    })}\n\n`;
+  };
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const data: unknown = JSON.parse(payload);
+            if (isRecord(data)) {
+              if (data.type === 'content_block_delta' && isRecord(data.delta) && typeof data.delta.text === 'string') {
+                yield chunk({ content: data.delta.text });
+              } else if (data.type === 'message_delta' && isRecord(data.delta) && data.delta.stop_reason) {
+                const finish = data.delta.stop_reason === 'max_tokens' ? 'length' : 'stop';
+                yield chunk({}, finish);
+              }
+            }
+          } catch {}
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  yield 'data: [DONE]\n\n';
+}
+
+/** Convert Gemini SSE stream to Anthropic SSE events */
+async function* geminiStreamToAnthropic(stream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let started = false;
+
+  const sse = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const data: unknown = JSON.parse(payload);
+            if (isRecord(data)) {
+              if (!started) {
+                started = true;
+                yield sse('message_start', {
+                  type: 'message_start',
+                  message: { id: 'msg_stream', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } }
+                });
+                yield sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+              }
+              const text = geminiResponseText(data);
+              if (text !== '') {
+                yield sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+              }
+              const cand = Array.isArray(data.candidates) && isRecord(data.candidates[0]) ? data.candidates[0] : null;
+              if (cand && cand.finishReason) {
+                const stop = cand.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn';
+                yield sse('content_block_stop', { type: 'content_block_stop', index: 0 });
+                yield sse('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 1 } });
+                yield sse('message_stop', { type: 'message_stop' });
+              }
+            }
+          } catch {}
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** Execute request with quality ranking and automatic quota/error failover */
+async function executeWithFailover(candidates: Candidate[], openAIBody: Json, stream: boolean): Promise<{ response: Response; candidate: Candidate } | null> {
+  for (const candidate of candidates) {
+    try {
+      const res = await callProviderAny(candidate.probe, candidate.model.id, openAIBody, stream);
+      // Quota spent or rate limit exceeded: 402, 429, or 5xx server errors trigger failover
+      if (res.status === 402 || res.status === 429 || res.status >= 500) {
+        continue;
+      }
+      return { response: res, candidate };
+    } catch {
+      // Network drop or unreachable: try next candidate
+      continue;
+    }
+  }
+  return null;
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client, served with multi-wire routing & failover. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
+  const reqs = requirementsFor(body);
+  const candidates = candidatesFor(reqs);
+  if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+
+  const stream = body.stream === true;
+  const result = await executeWithFailover(candidates, body, stream);
+  if (result === null) {
+    return sendError(res, 'openai', 503, 'upstream_exhausted', 'all candidate models failed or exhausted quota');
   }
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, { ...body, model: route.model.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
-  }
-  if (body.stream === true && upstream.ok && upstream.body !== null) {
+
+  const { response: upstream, candidate } = result;
+  const wire = candidate.probe.provider.wire;
+  const modelId = candidate.model.id;
+
+  if (stream && upstream.ok && upstream.body !== null) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    await pipeStream(upstream.body, res);
+    if (wire === 'openai') {
+      await pipeStream(upstream.body, res);
+    } else if (wire === 'gemini') {
+      for await (const chunk of geminiStreamToOpenAI(upstream.body, modelId)) res.write(chunk);
+      res.end();
+    } else if (wire === 'anthropic') {
+      for await (const chunk of anthropicStreamToOpenAI(upstream.body, modelId)) res.write(chunk);
+      res.end();
+    }
     return;
   }
-  // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-  // the requirements (10% of the score), and count the call it cost.
-  const text = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-  res.end(text);
+
+  if (wire === 'openai') {
+    const text = await upstream.text();
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(text);
+    return;
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    return sendError(res, 'openai', upstream.status, 'api_error', text.slice(0, 500));
+  }
+
+  const jsonVal: unknown = await upstream.json();
+  const parsedObj = isRecord(jsonVal) ? jsonVal : {};
+  if (wire === 'gemini') {
+    sendJson(res, 200, geminiToOpenAI(parsedObj, modelId));
+  } else if (wire === 'anthropic') {
+    sendJson(res, 200, anthropicToOpenAIResponse(parsedObj, modelId));
+  }
 }
 
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to an openai-wire provider and answered back. */
+/** POST /v1/messages: an Anthropic-shaped client, served with multi-wire routing & failover. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
+  const reqs = requirementsFor(body);
+  const candidates = candidatesFor(reqs);
+  if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
+
+  const stream = body.stream === true;
+  // Convert Anthropic client request to OpenAI intermediate representation for unified routing
+  const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0].model.id;
+  const openAIBody = anthropicToOpenAI(body, requestedModel);
+
+  const result = await executeWithFailover(candidates, openAIBody, stream);
+  if (result === null) {
+    return sendError(res, 'anthropic', 503, 'overloaded_error', 'all candidate models failed or exhausted quota');
   }
-  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
+
+  const { response: upstream, candidate } = result;
+  const wire = candidate.probe.provider.wire;
+  const modelId = candidate.model.id;
+
+  if (stream && upstream.ok && upstream.body !== null) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    if (wire === 'anthropic') {
+      await pipeStream(upstream.body, res);
+    } else if (wire === 'openai') {
+      for await (const event of anthropicEventsFromOpenAI(upstream.body, requestedModel)) res.write(event);
+      res.end();
+    } else if (wire === 'gemini') {
+      for await (const event of geminiStreamToAnthropic(upstream.body, requestedModel)) res.write(event);
+      res.end();
+    }
+    return;
   }
+
+  if (wire === 'anthropic') {
+    const text = await upstream.text();
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(text);
+    return;
+  }
+
   if (!upstream.ok) {
-    // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-    // the requirements (10% of the score), and count the call it cost.
     const text = await upstream.text();
     return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
   }
-  if (body.stream === true && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
-    res.end();
-    return;
+
+  const jsonVal: unknown = await upstream.json();
+  const parsedObj = isRecord(jsonVal) ? jsonVal : {};
+  if (wire === 'openai') {
+    sendJson(res, 200, openAIToAnthropic(parsedObj, requestedModel));
+  } else if (wire === 'gemini') {
+    const intermediateOpenAI = geminiToOpenAI(parsedObj, modelId);
+    sendJson(res, 200, openAIToAnthropic(intermediateOpenAI, requestedModel));
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
